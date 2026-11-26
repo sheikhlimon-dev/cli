@@ -246,7 +246,7 @@ pub struct Check {
     pub unresolved_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Finding {
     pub id: Uuid,
     /// The retained semantic identity that correlates this finding's
@@ -262,7 +262,7 @@ pub struct Finding {
     pub evidence_refs: Vec<EvidenceRef>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EvidenceRef {
     pub kind: String,
     pub label: String,
@@ -414,10 +414,18 @@ pub struct CommitDeployVerifications {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CommitDeploy {
     pub environment_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_run_id: Option<String>,
     #[serde(default)]
     pub github_environment: Option<String>,
     #[serde(default)]
     pub deployment_task: Option<String>,
+    /// The deploy's GitHub deployments. Absent from older servers, so
+    /// `--deployment` matches none of their deploys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub github_deployment_ids: Vec<i64>,
     #[serde(default)]
     pub workflow_run_id: Option<i64>,
     #[serde(default)]
@@ -438,6 +446,11 @@ pub struct CommitDeploy {
     /// deploy again. Absent from older servers, which read as false.
     #[serde(default)]
     pub rolled_back: bool,
+    /// Whether the deploy's verification ended, so a check it has not
+    /// recorded never will be. Absent from older servers, which read as
+    /// false and leave a missing check to the wait.
+    #[serde(default)]
+    pub verification_ended: bool,
 }
 
 /// The deploy a rollback restores, when the read names one, and the deploys

@@ -34,6 +34,9 @@ pub enum ApiError {
         origin: String,
         status: u16,
         detail: String,
+        /// The problem's `code` extension member, the cause the server
+        /// names for a refusal a caller acts on.
+        code: Option<String>,
     },
     #[error("could not reach {origin}: {reason}")]
     Transport { origin: String, reason: String },
@@ -43,6 +46,20 @@ pub enum ApiError {
     /// runner issued no identity, or the exchange named another organization.
     #[error("could not renew this job's credential: {reason}")]
     Renewal { reason: String },
+}
+
+impl ApiError {
+    /// Whether another read could succeed: the request did not reach
+    /// Proofline or timed out, or Proofline answered with a 5xx status. A
+    /// refusal, an unreadable answer and a credential that could not be
+    /// renewed are not.
+    pub(crate) const fn transient(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Problem { status, .. } => *status >= 500,
+            Self::Protocol { .. } | Self::Renewal { .. } => false,
+        }
+    }
 }
 
 /// Closed transport failures for the stdio bridge. Upstream bodies and client
@@ -119,12 +136,21 @@ impl ApiError {
             Self::Transport { .. } | Self::Protocol { .. } | Self::Renewal { .. } => None,
         }
     }
+
+    /// The refusal's `code`, such as `repository_write_access_required`.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Problem { code, .. } => code.as_deref(),
+            Self::Transport { .. } | Self::Protocol { .. } | Self::Renewal { .. } => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct Problem {
     title: Option<String>,
     detail: Option<String>,
+    code: Option<String>,
 }
 
 /// A response that arrived with an HTTP status, and its bounded body.
@@ -306,6 +332,7 @@ impl Http {
 
     pub fn problem(&self, reply: &Reply) -> ApiError {
         let parsed = serde_json::from_slice::<Problem>(&reply.body).ok();
+        let code = parsed.as_ref().and_then(|problem| problem.code.clone());
         let detail = parsed
             .and_then(|problem| problem.detail.or(problem.title))
             .map_or_else(
@@ -322,6 +349,7 @@ impl Http {
             origin: self.origin.to_string(),
             status: reply.status.as_u16(),
             detail,
+            code,
         }
     }
 
@@ -487,13 +515,25 @@ impl Api {
         self.get(url).await
     }
 
+    pub(crate) async fn history_page(
+        &self,
+        repository: &str,
+        number: u64,
+        cursor: Option<&str>,
+    ) -> Result<serde_json::Value, ApiError> {
+        let mut url = self.url_list_pull_request_reviews(repository, &number.to_string());
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        self.get(url).await
+    }
+
     pub(crate) async fn history(
         &self,
         repository: &str,
         number: u64,
     ) -> Result<serde_json::Value, ApiError> {
-        self.get(self.url_list_pull_request_reviews(repository, &number.to_string()))
-            .await
+        self.history_page(repository, number, None).await
     }
 
     /// One pull request's review runs as received, with the review

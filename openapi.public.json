@@ -504,7 +504,7 @@
         "type": "object"
       },
       "CheckFile": {
-        "description": "One file World cited for a check's result.",
+        "description": "One file the evaluator cited for a check's result.",
         "properties": {
           "path": {
             "allOf": [
@@ -520,7 +520,7 @@
                 "$ref": "#/components/schemas/CheckFileRevision"
               }
             ],
-            "description": "The revision World read the file at."
+            "description": "The revision the evaluator read the file at."
           }
         },
         "required": [
@@ -545,7 +545,7 @@
         ]
       },
       "CheckLifecycle": {
-        "description": "World's lifecycle disclosure for the evaluator version that answered, as\n the receipt recorded it. A deployment gate counts only `GATING` results\n (`DeterministicCoverage::gate_effective_status`), and only when it\n evaluates a deployment; the lifecycle alone permits or blocks nothing.",
+        "description": "The lifecycle the evaluator disclosed for the version that answered, as\n the receipt recorded it. A deployment gate counts only `GATING` results\n (`DeterministicCoverage::gate_effective_status`), and only when it\n evaluates a deployment; the lifecycle alone permits or blocks nothing.",
         "oneOf": [
           {
             "const": "GATING",
@@ -801,6 +801,20 @@
       "CommitDeploy": {
         "description": "One deploy of the commit and where its verification stands.",
         "properties": {
+          "aws_provider": {
+            "description": "The provider of an AWS deploy (`AWS_CODEPIPELINE` or `AWS_AMPLIFY`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "aws_run_id": {
+            "description": "The `CodePipeline` execution ID or Amplify job ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "checkpoints": {
             "description": "The four checks in order, each with its recorded result, if any, and\n when a missing one becomes overdue. Empty when no verification of\n the deploy exists.",
             "items": {
@@ -831,6 +845,14 @@
             "description": "What the checks that leave the deploy unproven name.",
             "items": {
               "$ref": "#/components/schemas/DeployVerificationGap"
+            },
+            "type": "array"
+          },
+          "github_deployment_ids": {
+            "description": "The ID of each GitHub deployment the deploy holds, ascending: the\n deployment a pipeline created, or each one an Actions run's jobs\n created. A deployment outside Actions is a deploy of its own, so two\n of one commit, GitHub Environment and task read apart by this ID.\n Every GitHub deploy holds one; a server from before the field existed\n omits it.",
+            "items": {
+              "format": "int64",
+              "type": "integer"
             },
             "type": "array"
           },
@@ -868,6 +890,11 @@
               }
             ],
             "description": "Where the deploy's verification stands."
+          },
+          "verification_ended": {
+            "default": false,
+            "description": "Whether the deploy's verification ended. A check with no `result`\n then will never be recorded, while a running verification can still\n record one that is overdue; `state` reads `UNRECORDED` for both.\n False without a verification, which `state` reads as `UNVERIFIED`.\n Older responses omit it, which reads as false.",
+            "type": "boolean"
           },
           "workflow_run_attempt": {
             "description": "The attempt of that run that created the deployment addressing the\n deploy; above 1 for a rerun.",
@@ -1022,9 +1049,12 @@
           },
           {
             "$ref": "#/components/schemas/CreditRefusalCause"
+          },
+          {
+            "$ref": "#/components/schemas/InstallationRefusalCause"
           }
         ],
-        "description": "What a review is counted under: the cause its assessments recorded,\n `SPEND_LIMIT_REACHED` where an assessment recorded a spend limit's code, or\n `OUT_OF_CREDITS` where an assessment recorded the credit refusal. An\n assessment's detail names that refusal by the rule `public_reason_codes`\n applies; no other detail is read into the summary."
+        "description": "What a review is counted under: the cause its assessments recorded,\n `SPEND_LIMIT_REACHED` where an assessment recorded a spend limit's code,\n `OUT_OF_CREDITS` where an assessment recorded the credit refusal, or\n `GITHUB_REFUSED` where a code assessment ended on GitHub's refusal of a\n source read. An assessment's detail names the credit refusal by the rule\n `public_reason_codes` applies; no other detail is read into the summary."
       },
       "CoverageRefused": {
         "description": "An upload refused for its content: a symbolic or unknown commit, or a\n report that cannot be read. Nothing is stored.",
@@ -1143,7 +1173,7 @@
                 "$ref": "#/components/schemas/CustomerChecks"
               }
             ],
-            "description": "The deterministic World checks recorded for this assessment."
+            "description": "The deterministic environment checks recorded for this assessment.\n Only assessments made by the check evaluator Proofline retired on\n 2026-11-05 carry them. A later assessment records none, and\n `receipt_recorded` is then false."
           },
           "completed_at": {
             "description": "When the assessment completed. Null while it has not.",
@@ -1231,7 +1261,7 @@
                 "$ref": "#/components/schemas/CustomerChecks"
               }
             ],
-            "description": "The deterministic World checks recorded for this assessment."
+            "description": "The deterministic environment checks recorded for this assessment.\n Only assessments made by the check evaluator Proofline retired on\n 2026-11-05 carry them. A later assessment records none, and\n `receipt_recorded` is then false."
           },
           "completed_at": {
             "description": "When the assessment completed. Null while it has not.",
@@ -1328,21 +1358,21 @@
       "CustomerCheck": {
         "properties": {
           "detail": {
-            "description": "Why World refused the check, or otherwise World's recorded explanation\n of the result. Null when neither is recorded.",
+            "description": "Why the evaluator refused the check, or otherwise its recorded\n explanation of the result. Null when neither is recorded.",
             "type": [
               "string",
               "null"
             ]
           },
           "evaluated_at": {
-            "description": "When World evaluated this answer. A reused answer is evidence from\n this instant, which can precede the assessment.",
+            "description": "When the evaluator produced this answer. A reused answer is evidence\n from this instant, which can precede the assessment.",
             "type": [
               "string",
               "null"
             ]
           },
           "files": {
-            "description": "The files World cited as evidence for this result, once each in\n World's order, with the revision World read each at. Empty when World\n cited no file, and on results recorded before World cited files.",
+            "description": "The files the evaluator cited as evidence for this result, once each\n in the evaluator's order, with the revision it read each at. Empty\n when it cited no file, and on results recorded before it cited files.",
             "items": {
               "$ref": "#/components/schemas/CheckFile"
             },
@@ -1373,7 +1403,7 @@
                 "type": "null"
               }
             ],
-            "description": "Why an `UNRESOLVED` check did not settle, as World's verdict gave it.\n Absent on every other outcome, and on an unresolved receipt whose\n verdict names none of these reasons."
+            "description": "Why an `UNRESOLVED` check did not settle, as the evaluator's verdict\n gave it.\n Absent on every other outcome, and on an unresolved receipt whose\n verdict names none of these reasons."
           }
         },
         "required": [
@@ -1410,7 +1440,7 @@
         "type": "object"
       },
       "CustomerCodeAssessment": {
-        "description": "The review's code assessment as it recorded its run. Its findings\n rest on the pinned code alone, never on World evidence.",
+        "description": "The review's code assessment as it recorded its run. Its findings\n rest on the pinned code alone, never on infrastructure evidence.",
         "properties": {
           "base_commit_sha": {
             "description": "The base commit the code assessment compared the head with.",
@@ -1538,7 +1568,7 @@
             "type": "string"
           },
           "label": {
-            "description": "The reference's display label, such as a path with its line range. A\n recorded read, a vendor documentation read or an unnamed World entity\n carries a fixed label, and a deterministic test carries its check's\n readable name.",
+            "description": "The reference's display label, such as a path with its line range. A\n recorded read, a vendor documentation read, a customer tool call, a\n static analysis result or an unnamed infrastructure entity carries a fixed\n label, and a deterministic test carries its check's readable name.",
             "type": "string"
           },
           "legacy_text": {
@@ -1921,7 +1951,7 @@
                 "type": "null"
               }
             ],
-            "description": "The change-level diagram: the changed call path from the pinned code\n index and the relations World declares. Absent when the review\n recorded none."
+            "description": "The change-level diagram: the changed call path from the pinned code\n index. A diagram recorded by the check evaluator Proofline retired on\n 2026-11-05 can also show the environment relations it returned.\n Absent when the review recorded none."
           },
           "change_summary": {
             "anyOf": [
@@ -1987,7 +2017,7 @@
             ]
           },
           "counted_incomplete_causes": {
-            "description": "`incomplete_causes` as the Inbox and the reviews `cause:` search\n count them: `OUT_OF_CREDITS` or `SPEND_LIMIT_REACHED` in place of the\n `NOT_CONFIGURED` an assessment records when credits or a monthly spend\n limit refused it. Present exactly when\n `incomplete_causes` is.",
+            "description": "`incomplete_causes` as the Inbox and the reviews `cause:` search\n count them: `OUT_OF_CREDITS` or `SPEND_LIMIT_REACHED` in place of the\n `NOT_CONFIGURED` an assessment records when credits or a monthly spend\n limit refused it, and `GITHUB_REFUSED` in place of the\n `EVIDENCE_UNAVAILABLE` a code assessment records when GitHub refused\n its source read. Present exactly when\n `incomplete_causes` is.",
             "items": {
               "$ref": "#/components/schemas/CountedCause"
             },
@@ -2042,7 +2072,7 @@
             "type": "array"
           },
           "finding_count": {
-            "description": "How many findings this review's assessments recorded, across all of them.",
+            "description": "How many findings this review's assessments recorded, across all of\n them, with the supported findings its KIAN assessments published.",
             "format": "int64",
             "type": "integer"
           },
@@ -3335,7 +3365,7 @@
           },
           {
             "const": "WORLD_EVIDENCED",
-            "description": "A World entity or deterministic World evaluation at the pinned snapshot.",
+            "description": "An infrastructure entity or deterministic check result at the pinned\n snapshot, recorded by the check evaluator Proofline retired on\n 2026-11-05.",
             "type": "string"
           },
           {
@@ -3672,7 +3702,8 @@
         "enum": [
           "outcome",
           "code_changed",
-          "post_merge"
+          "post_merge",
+          "published"
         ],
         "type": "string"
       },
@@ -4165,6 +4196,16 @@
           }
         ]
       },
+      "InstallationRefusalCause": {
+        "description": "A GitHub refusal the App installation repairs, named apart from the\n `EVIDENCE_UNAVAILABLE` it records.",
+        "oneOf": [
+          {
+            "const": "GITHUB_REFUSED",
+            "description": "GitHub refused the code lane's read of the repository's files with a\n 403 that named no rate limit, so the code assessment stopped.",
+            "type": "string"
+          }
+        ]
+      },
       "KianFindingSource": {
         "description": "What published a supported Kian finding.",
         "oneOf": [
@@ -4334,6 +4375,24 @@
           "review_id",
           "finding_id",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "ModelWarning": {
+        "description": "Why a review started now would run without its model.",
+        "properties": {
+          "cause": {
+            "description": "Proofline's sentence naming the fix.",
+            "type": "string"
+          },
+          "reason_code": {
+            "description": "`MODEL_<cause>`, the same code a finished review's read carries.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason_code",
+          "cause"
         ],
         "type": "object"
       },
@@ -5749,7 +5808,7 @@
             ]
           },
           "counted_incomplete_causes": {
-            "description": "`incomplete_causes` as the Inbox and the reviews `cause:` search\n count them: `OUT_OF_CREDITS` or `SPEND_LIMIT_REACHED` in place of the\n `NOT_CONFIGURED` an assessment records when credits or a monthly spend\n limit refused it. Present exactly when\n `incomplete_causes` is.",
+            "description": "`incomplete_causes` as the Inbox and the reviews `cause:` search\n count them: `OUT_OF_CREDITS` or `SPEND_LIMIT_REACHED` in place of the\n `NOT_CONFIGURED` an assessment records when credits or a monthly spend\n limit refused it, and `GITHUB_REFUSED` in place of the\n `EVIDENCE_UNAVAILABLE` a code assessment records when GitHub refused\n its source read. Present exactly when\n `incomplete_causes` is.",
             "items": {
               "$ref": "#/components/schemas/CountedCause"
             },
@@ -5775,7 +5834,7 @@
             "type": "array"
           },
           "finding_count": {
-            "description": "How many findings this review's assessments recorded, across all of them.",
+            "description": "How many findings this review's assessments recorded, across all of\n them, with the supported findings its KIAN assessments published.",
             "format": "int64",
             "type": "integer"
           },
@@ -6433,6 +6492,17 @@
             "description": "True when this head already carried a review and that one is\n returned. Clicking twice does not run twice.",
             "type": "boolean"
           },
+          "model_warning": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelWarning"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why this review runs without its model and checks fixed rules only,\n for a caller that started it without reading the offer's warning."
+          },
           "review_id": {
             "description": "The review that owns the live head, new or existing.",
             "format": "uuid",
@@ -7030,11 +7100,11 @@
         "type": "string"
       },
       "UnresolvedReason": {
-        "description": "World's reason an executed check did not settle. A gate weighs the three\n alike, and each asks the reader for a different response.",
+        "description": "The evaluator's reason an executed check did not settle. A gate weighs the three\n alike, and each asks the reader for a different response.",
         "oneOf": [
           {
             "const": "NEEDS_EVIDENCE",
-            "description": "The evidence World held neither established nor refuted the property.",
+            "description": "The evidence the evaluator held neither established nor refuted the\n property.",
             "type": "string"
           },
           {
@@ -7205,7 +7275,7 @@
   },
   "info": {
     "title": "Proofline Review API",
-    "version": "9.2.0"
+    "version": "10.2.0"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -225,10 +225,16 @@ async fn status_preserves_metadata_and_reports_failed_checks_with_exit_one() {
     ] {
         let requests = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&requests);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let origin = format!("http://{}", socket.local_addr().unwrap());
+        // With no server, the socket stays bound until the loop ends and never
+        // listens, so connections to it are refused. A dropped listener freed
+        // its port, and another test's server could bind it and accept the
+        // token (#43815).
         let server =
-            if let Some(status) = status {
+            status.map(|status| {
+                let listener = socket.listen(1024).unwrap();
                 let app = Router::new().route(
                 &format!("/api/v1/organizations/{ORG}/reviews"),
                 get(move |headers: HeaderMap| {
@@ -255,13 +261,10 @@ async fn status_preserves_metadata_and_reports_failed_checks_with_exit_one() {
                     Json(json!({ "scopes": ["setup:write", "org:configure"], "state": "ENDED" }))
                 }),
             );
-                Some(tokio::spawn(async move {
+                tokio::spawn(async move {
                     axum::serve(listener, app).await.unwrap();
-                }))
-            } else {
-                drop(listener);
-                None
-            };
+                })
+            });
         let output = cli(&origin, &["status"]).await;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1357,10 +1360,13 @@ struct CiCodeFinding {
 
 /// A console that lists `kind` at `CI_HEAD` in `acme/app` and serves its detail
 /// with `status` and an assessment in `assessment`. With `open`, the
-/// ENV assessment lists one SERIOUS finding and the review counts `open` as
-/// its open and serious ENV findings. CODE findings are separate from those
-/// counts. Every request path is recorded, so a test can tell that nothing
-/// was requested.
+/// ENV assessment lists one finding, WARNING when `open` counts no serious
+/// finding and SERIOUS otherwise, and the review counts `open` as its open
+/// and serious findings. As on the server, the counts hold both lanes under
+/// their decisions: `[0, 0]` beside a listed finding means a person dismissed
+/// it. It also accepts a review request for pull request 12, which answers
+/// with `CI_REVIEW`. Every request path is recorded, so a test can tell that
+/// nothing was requested.
 async fn ci_console(
     kind: &'static str,
     status: StatusCode,
@@ -1371,9 +1377,9 @@ async fn ci_console(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let findings = match open {
         None => json!([]),
-        Some(_) => json!([{
+        Some([open_findings, serious_findings]) => json!([{
             "id": "0190f3a0-0000-7000-8000-0000000000f3",
-            "severity": "SERIOUS",
+            "severity": if serious_findings == 0 && open_findings > 0 { "WARNING" } else { "SERIOUS" },
             "risk_domain": "data_integrity",
             "claim": "Orders are dropped on retry.",
             "impact": "orders are lost",
@@ -1445,6 +1451,19 @@ async fn ci_console(
                     "next_cursor": null,
                     "truncated": false,
                     "filters": { "repositories": [], "environments": [], "authors": [] },
+                }))
+            }),
+        )
+        .route(
+            &format!(
+                "/api/v1/organizations/{ORG}/repositories/{CI_REPOSITORY}/pull-requests/12/review"
+            ),
+            post(|| async {
+                Json(json!({
+                    "review_id": CI_REVIEW,
+                    "run_number": 1,
+                    "existing": true,
+                    "automatic_reviews_paused": false,
                 }))
             }),
         )
@@ -1840,9 +1859,9 @@ async fn ci_review_fail_on_exits_three_for_an_open_finding_of_a_complete_review(
         head: CI_HEAD,
         status: Some("INCOMPLETE"),
     });
-    // Server counts cover ENV only. CODE-only reviews report [0, 0] even
-    // when they contain a serious finding. The exit codes are without the
-    // flag, under `warning` and under `serious`.
+    // The server's counts hold the findings of both lanes under their
+    // decisions, so they alone decide the threshold. The exit codes are
+    // without the flag, under `warning` and under `serious`.
     let cases = [
         // A person dismissed the finding, so nothing is open.
         (Some([0, 0]), "COMPLETED", None, [0, 0, 0]),
@@ -1852,14 +1871,23 @@ async fn ci_review_fail_on_exits_three_for_an_open_finding_of_a_complete_review(
         (None, "COMPLETED", None, [0, 4, 4]),
         // A review that did not finish exits 2 whatever it found.
         (Some([1, 1]), "INCOMPLETE", None, [2, 2, 2]),
+        // An open SERIOUS CODE finding, as the server counts it.
         (
-            Some([0, 0]),
+            Some([1, 1]),
             "COMPLETED",
             code(true, Some("SERIOUS"), "NEW"),
             [0, 3, 3],
         ),
+        // A person dismissed the CODE finding, so nothing is open although
+        // its lifecycle is still NEW.
         (
             Some([0, 0]),
+            "COMPLETED",
+            code(true, Some("SERIOUS"), "NEW"),
+            [0, 0, 0],
+        ),
+        (
+            Some([1, 0]),
             "COMPLETED",
             code(true, Some("WARNING"), "NEW"),
             [0, 3, 0],
@@ -1883,24 +1911,26 @@ async fn ci_review_fail_on_exits_three_for_an_open_finding_of_a_complete_review(
             [0, 4, 4],
         ),
         (
-            Some([0, 0]),
+            Some([1, 1]),
             "INCOMPLETE",
             code(true, Some("SERIOUS"), "NEW"),
             [2, 2, 2],
         ),
-        // A CODE finding can reach a threshold the ENV counts do not.
+        // The counts hold both lanes: the ENV and the CODE finding.
         (
-            Some([1, 0]),
+            Some([2, 2]),
             "COMPLETED",
             code(false, Some("SERIOUS"), "NEW"),
             [0, 3, 3],
         ),
-        // The complete environment completes the review, but a partial CODE
-        // assessment's findings are not its whole result.
-        (Some([0, 0]), "COMPLETED", partial, [0, 0, 0]),
-        // A CODE record of another head neither completes the review nor
-        // reaches a threshold, and the environment still decides.
-        (Some([0, 0]), "COMPLETED", other_subject(true), [2, 2, 2]),
+        // The complete environment completes the review beside a partial
+        // CODE assessment, and the server counts the partial assessment's
+        // open finding too, so it reaches both thresholds.
+        (Some([2, 2]), "COMPLETED", partial, [0, 3, 3]),
+        // A CODE record of another head does not complete a CODE-only review.
+        // Beside a complete environment the review completes, and its counts
+        // decide.
+        (Some([1, 1]), "COMPLETED", other_subject(true), [2, 2, 2]),
         (Some([0, 0]), "COMPLETED", other_subject(false), [0, 0, 0]),
     ];
     for (open, assessment, code_finding, codes) in cases {
@@ -1918,18 +1948,28 @@ async fn ci_review_fail_on_exits_three_for_an_open_finding_of_a_complete_review(
             code_finding,
         )
         .await;
-        for (fail_on, code) in [None, Some("warning"), Some("serious")]
-            .into_iter()
-            .zip(codes)
-        {
-            let mut args = vec!["ci", "review", "--repo", "acme/app", "--commit", CI_HEAD];
+        // `review --pr` measures a pull-request review as `ci review` does.
+        let commands: [&[&str]; 2] = [
+            &["ci", "review", "--repo", "acme/app", "--commit", CI_HEAD],
+            &["review", "--repo", "acme/app", "--pr", "12"],
+        ];
+        for (command, (fail_on, code)) in commands.into_iter().flat_map(|command| {
+            [None, Some("warning"), Some("serious")]
+                .into_iter()
+                .zip(codes)
+                .map(move |case| (command, case))
+        }) {
+            let mut args = command.to_vec();
             args.extend(["--timeout", "0", "--json"]);
             if let Some(threshold) = fail_on {
                 args.extend(["--fail-on", threshold]);
             }
             let output = cli(&origin, &args).await;
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let case = format!("{open:?} {assessment} {fail_on:?} {code_finding:?}: {stderr}");
+            let case = format!(
+                "{} {open:?} {assessment} {fail_on:?} {code_finding:?}: {stderr}",
+                command[0]
+            );
             assert_eq!(output.status.code(), Some(code), "{case}");
             assert_eq!(
                 stderr.contains("at or above the --fail-on severity"),
@@ -1970,11 +2010,9 @@ async fn ci_review_fail_on_exits_three_for_an_open_finding_of_a_complete_review(
 /// A console whose search page names `CI_REVIEW` as the pull-request review of
 /// `CI_HEAD`, but whose `/reviews/{CI_REVIEW}` detail disagrees with that: the
 /// body it serves names a different review id and a different head commit, as
-/// a stale search index or a mixed-up cache response would. `sarif::validate_subject`
-/// already refuses exactly this mismatch, but only when `--sarif` is passed;
-/// `ci_review`'s plain and `--json` paths never call it, so they compute
-/// `ci_verdict` from a detail that was never confirmed to be the review, or
-/// the commit, actually under test.
+/// a stale search index or a mixed-up cache response would. `confirm_ci_subject`
+/// refuses that detail on every `ci review` path, before `ci_verdict` reads it,
+/// and `sarif::validate_subject` refuses it again when `--sarif` is passed.
 async fn mismatched_identity_console() -> String {
     let other_review = "0190f3a0-0000-7000-8000-0000000000e1";
     let other_head = "fedcba9876543210fedcba9876543210fedcba98";
@@ -2064,10 +2102,8 @@ async fn ci_review_refuses_a_completed_review_whose_detail_names_another_review_
     );
     assert!(!stderr.contains(TOKEN));
 
-    // The same mismatch, surfaced through `--sarif`, is already refused:
-    // `read_review` runs `sarif::validate_subject` only when SARIF is
-    // requested, so the identity check exists but is not wired into the path
-    // `ci review` actually uses to decide pass/fail.
+    // With `--sarif` the same mismatch is refused before any SARIF is
+    // written.
     let directory = tempfile::tempdir().unwrap();
     let sarif_path = directory.path().join("proofline.sarif");
     let mut sarif_args = args.to_vec();
@@ -3581,4 +3617,384 @@ async fn config_proposal_targets_must_match_the_selected_organization() {
     );
     assert_eq!(server.requests()[0]["arguments"]["organization_id"], ORG);
     assert_eq!(server.frames.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn diff_categorizes_findings_and_honors_fail_on_regression() {
+    let prefix = format!("/api/v1/organizations/{ORG}");
+    let run1_id = "0190f3a0-0000-7000-8000-000000000001";
+    let run2_id = "0190f3a0-0000-7000-8000-000000000002";
+    let run3_id = "0190f3a0-0000-7000-8000-000000000003";
+    let run_incomplete_id = "0190f3a0-0000-7000-8000-000000000004";
+
+    let finding_persist = json!({
+        "id": "0190f3a0-0000-7000-8000-000000000010",
+        "severity": "MEDIUM",
+        "risk_domain": "input_validation",
+        "claim": "missing length check",
+        "impact": "potential buffer overflow",
+        "lifecycle_state": "NEW",
+        "finding_fingerprint": "fp_persist",
+        "evidence_refs": []
+    });
+    let finding_persist_run2 = json!({
+        "id": "0190f3a0-0000-7000-8000-000000000020",
+        "severity": "MEDIUM",
+        "risk_domain": "input_validation",
+        "claim": "missing length check",
+        "impact": "potential buffer overflow",
+        "lifecycle_state": "NEW",
+        "finding_fingerprint": "fp_persist",
+        "evidence_refs": []
+    });
+    let finding_resolved = json!({
+        "id": "0190f3a0-0000-7000-8000-000000000011",
+        "severity": "HIGH",
+        "risk_domain": "resource_capacity",
+        "claim": "connection pool leak",
+        "impact": "exhausted connections",
+        "lifecycle_state": "NEW",
+        "finding_fingerprint": "fp_resolved",
+        "evidence_refs": []
+    });
+    let finding_regression = json!({
+        "id": "0190f3a0-0000-7000-8000-000000000012",
+        "severity": "SERIOUS",
+        "risk_domain": "data_integrity",
+        "claim": "unindexed foreign key",
+        "impact": "deadlocks under load",
+        "lifecycle_state": "NEW",
+        "finding_fingerprint": "fp_regression",
+        "evidence_refs": []
+    });
+    let finding_run3 = json!({
+        "id": "0190f3a0-0000-7000-8000-000000000013",
+        "severity": "LOW",
+        "risk_domain": "documentation",
+        "claim": "missing api doc",
+        "impact": "minor",
+        "lifecycle_state": "NEW",
+        "finding_fingerprint": "fp_run3_unique",
+        "evidence_refs": []
+    });
+
+    let app = Router::new().fallback(move |request: axum::extract::Request| {
+        let prefix = prefix.clone();
+        let finding_persist = finding_persist.clone();
+        let finding_persist_run2 = finding_persist_run2.clone();
+        let finding_resolved = finding_resolved.clone();
+        let finding_regression = finding_regression.clone();
+        let finding_run3 = finding_run3.clone();
+        async move {
+            let path = request.uri().path().to_owned();
+            if path == format!("{prefix}/reviews") {
+                return Json(json!({
+                    "items": [],
+                    "next_cursor": null,
+                    "truncated": false,
+                    "filters": {"repositories": [{"id": REPOSITORY, "name": "Owner/Repo"}]},
+                }));
+            }
+            if path == format!("{prefix}/reviews/pr/Repo/7") {
+                return Json(json!({
+                    "items": [
+                        {
+                            "run_number": 1,
+                            "id": run1_id,
+                            "kind": "PULL_REQUEST",
+                            "repository_id": REPOSITORY,
+                            "pull_request_number": 7,
+                            "status": "COMPLETED",
+                            "created_at": "2026-01-01T00:00:00Z"
+                        },
+                        {
+                            "run_number": 2,
+                            "id": run2_id,
+                            "kind": "PULL_REQUEST",
+                            "repository_id": REPOSITORY,
+                            "pull_request_number": 7,
+                            "status": "COMPLETED",
+                            "created_at": "2026-01-02T00:00:00Z"
+                        },
+                        {
+                            "run_number": 3,
+                            "id": run3_id,
+                            "kind": "PULL_REQUEST",
+                            "repository_id": REPOSITORY,
+                            "pull_request_number": 7,
+                            "status": "COMPLETED",
+                            "created_at": "2026-01-03T00:00:00Z"
+                        }
+                    ],
+                    "next_cursor": null,
+                    "truncated": false,
+                    "filters": {"repositories": []}
+                }));
+            }
+            if path == format!("{prefix}/reviews/{run1_id}") {
+                return Json(json!({
+                    "id": run1_id,
+                    "kind": "PULL_REQUEST",
+                    "status": "COMPLETED",
+                    "assessment_count": 0,
+                    "assessments": [],
+                    "code_assessment": {
+                        "id": "0190f3a0-0000-7000-8000-0000000000aa",
+                        "head_commit_sha": "89abcdef0123456789abcdef0123456789abcdef",
+                        "base_commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "status": "COMPLETED",
+                        "findings": [finding_persist, finding_resolved]
+                    },
+                    "pull_request_number": 7,
+                    "run_number": 1,
+                    "repository_full_name": "owner/repo"
+                }));
+            }
+            if path == format!("{prefix}/reviews/{run2_id}") {
+                return Json(json!({
+                    "id": run2_id,
+                    "kind": "PULL_REQUEST",
+                    "status": "COMPLETED",
+                    "assessment_count": 0,
+                    "assessments": [],
+                    "code_assessment": {
+                        "id": "0190f3a0-0000-7000-8000-0000000000bb",
+                        "head_commit_sha": "89abcdef0123456789abcdef0123456789abcdef",
+                        "base_commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "status": "COMPLETED",
+                        "findings": [finding_persist_run2, finding_regression]
+                    },
+                    "pull_request_number": 7,
+                    "run_number": 2,
+                    "repository_full_name": "owner/repo"
+                }));
+            }
+            if path == format!("{prefix}/reviews/{run3_id}") {
+                return Json(json!({
+                    "id": run3_id,
+                    "kind": "PULL_REQUEST",
+                    "status": "COMPLETED",
+                    "assessment_count": 0,
+                    "assessments": [],
+                    "code_assessment": {
+                        "id": "0190f3a0-0000-7000-8000-0000000000cc",
+                        "head_commit_sha": "89abcdef0123456789abcdef0123456789abcdef",
+                        "base_commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "status": "COMPLETED",
+                        "findings": [finding_persist, finding_run3]
+                    },
+                    "pull_request_number": 7,
+                    "run_number": 3,
+                    "repository_full_name": "owner/repo"
+                }));
+            }
+            if path == format!("{prefix}/reviews/{run_incomplete_id}") {
+                return Json(json!({
+                    "id": run_incomplete_id,
+                    "kind": "PULL_REQUEST",
+                    "status": "IN_PROGRESS",
+                    "assessment_count": 0,
+                    "assessments": [],
+                    "code_assessment": null,
+                    "pull_request_number": 7,
+                    "run_number": 4,
+                    "repository_full_name": "owner/repo"
+                }));
+            }
+            Json(json!({}))
+        }
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // 1. Text diff: PR run comparison with explicit non-default selectors (--base-run 1 --target-run 2)
+    let output = cli(
+        &origin,
+        &[
+            "diff",
+            "--repo",
+            "owner/repo",
+            "--pr",
+            "7",
+            "--base-run",
+            "1",
+            "--target-run",
+            "2",
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("Finding diff: Owner/Repo #7 run 1 -> Owner/Repo #7 run 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 resolved, 1 persistent, 1 regressions"),
+        "{text}"
+    );
+    assert!(text.contains("Regressions (1):"), "{text}");
+    assert!(text.contains("Resolved (1):"), "{text}");
+    assert!(text.contains("Persistent (1):"), "{text}");
+    assert!(text.contains("unindexed foreign key"), "{text}");
+    assert!(text.contains("connection pool leak"), "{text}");
+    assert!(text.contains("missing length check"), "{text}");
+
+    // 2. JSON diff with explicit non-default selectors
+    let output_json = cli(
+        &origin,
+        &[
+            "diff",
+            "--repo",
+            "owner/repo",
+            "--pr",
+            "7",
+            "--base-run",
+            "1",
+            "--target-run",
+            "2",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(output_json.status.success());
+    let parsed: Value = serde_json::from_slice(&output_json.stdout).unwrap();
+    assert_eq!(parsed["regressions"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["resolved"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["persistent"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        parsed["regressions"][0]["finding_fingerprint"],
+        "fp_regression"
+    );
+    assert_eq!(parsed["resolved"][0]["finding_fingerprint"], "fp_resolved");
+    assert_eq!(
+        parsed["persistent"][0]["id"],
+        "0190f3a0-0000-7000-8000-000000000020"
+    );
+
+    // Verify explicit --base-run 1 is honored when comparing against run 3
+    let output_run3 = cli(
+        &origin,
+        &[
+            "diff",
+            "--repo",
+            "owner/repo",
+            "--pr",
+            "7",
+            "--base-run",
+            "1",
+            "--target-run",
+            "3",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(output_run3.status.success());
+    let parsed_run3: Value = serde_json::from_slice(&output_run3.stdout).unwrap();
+    assert_eq!(
+        parsed_run3["resolved"][0]["finding_fingerprint"],
+        "fp_resolved"
+    );
+
+    // 3. Fail on regression exits code 3 (Verdict::Regressed)
+    let output_fail = cli(
+        &origin,
+        &[
+            "diff",
+            "--repo",
+            "owner/repo",
+            "--pr",
+            "7",
+            "--base-run",
+            "1",
+            "--target-run",
+            "2",
+            "--fail-on-regression",
+        ],
+    )
+    .await;
+    assert_eq!(output_fail.status.code(), Some(3));
+
+    // 4. Direct review IDs comparison with --json verifying both fingerprint identities
+    let output_direct = cli(
+        &origin,
+        &[
+            "diff",
+            "--base-review",
+            run1_id,
+            "--target-review",
+            run2_id,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(output_direct.status.success());
+    let direct_parsed: Value = serde_json::from_slice(&output_direct.stdout).unwrap();
+    assert_eq!(
+        direct_parsed["resolved"][0]["finding_fingerprint"],
+        "fp_resolved"
+    );
+    assert_eq!(
+        direct_parsed["regressions"][0]["finding_fingerprint"],
+        "fp_regression"
+    );
+
+    // 5. Fail on regression exits 0 when there are no regressions
+    let output_no_reg = cli(
+        &origin,
+        &[
+            "diff",
+            "--base-review",
+            run1_id,
+            "--target-review",
+            run1_id,
+            "--fail-on-regression",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(output_no_reg.status.success());
+    assert_eq!(output_no_reg.status.code(), Some(0));
+    let parsed_no_reg: Value = serde_json::from_slice(&output_no_reg.stdout).unwrap();
+    assert!(parsed_no_reg["regressions"].as_array().unwrap().is_empty());
+
+    // 6. Fail on regression returns Verdict::NotComplete (exit 2) if target review is not completed
+    let output_incomplete = cli(
+        &origin,
+        &[
+            "diff",
+            "--base-review",
+            run1_id,
+            "--target-review",
+            run_incomplete_id,
+            "--fail-on-regression",
+        ],
+    )
+    .await;
+    assert_eq!(output_incomplete.status.code(), Some(2));
+
+    // 7. Fail on regression returns Verdict::NotComplete (exit 2) if baseline review is not completed
+    let output_incomplete_base = cli(
+        &origin,
+        &[
+            "diff",
+            "--base-review",
+            run_incomplete_id,
+            "--target-review",
+            run1_id,
+            "--fail-on-regression",
+        ],
+    )
+    .await;
+    assert_eq!(output_incomplete_base.status.code(), Some(2));
+
+    server.abort();
 }

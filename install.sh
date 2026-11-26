@@ -15,7 +15,7 @@
 set -eu
 
 PROOFLINE_CLI=https://proofline.sh/cli
-PROOFLINE_INSTALLER_VERSION=0.5.3
+PROOFLINE_INSTALLER_VERSION=0.9.2
 PROOFLINE_SETUP_MIN_VERSION=0.1.8
 
 say() {
@@ -139,9 +139,25 @@ main() {
   mv -f "$directory/.proofline.$$" "$directory/proofline"
 
   say "installed $("$directory/proofline" --version) at $directory/proofline"
+  binary=proofline
   case ":${PATH:-}:" in
     *":$directory:"*) ;;
-    *) say "$directory is not on PATH; add it to run proofline by name" ;;
+    *)
+      binary=$directory/proofline
+      say "$directory is not on PATH; add it to run proofline by name"
+      # The file the login shell reads when a terminal opens. Terminal on macOS
+      # starts Bash as a login shell, which skips ~/.bashrc.
+      # The tilde is shown to the reader, not expanded.
+      # shellcheck disable=SC2088
+      case "${SHELL:-}:$(uname -s)" in
+        */zsh:*) profile='~/.zshrc' ;;
+        */bash:Darwin) profile='~/.bash_profile' ;;
+        */bash:*) profile='~/.bashrc' ;;
+        *) profile="your shell's startup file" ;;
+      esac
+      say "add this line to $profile, and run it here to use proofline in this terminal:"
+      say "  export PATH=\"$directory:\$PATH\""
+      ;;
   esac
   if [ "$setup" = true ]; then
     for client in claude-code cursor codex; do
@@ -149,13 +165,17 @@ main() {
         refuse "could not configure $client; earlier steps remain installed; fix the reported problem and rerun this command"
     done
     say "opening Proofline setup; sign in with GitHub and install the GitHub App for your team"
+    # A shell with no browser, such as a coding agent's on a remote host, still
+    # reaches sign-in: the address is printed for the person to open.
     "$directory/proofline" setup ||
-      refuse "could not open setup; visit https://proofline.sh/orgs and rerun this command after installing the GitHub App"
+      say "no browser opened here; open https://proofline.sh/orgs in a browser to install the GitHub App"
     "$directory/proofline" login --scope reviews:read --scope findings:read --scope guidance:read --scope reviews:request --scope setup:write --scope org:configure ||
-      refuse "CLI sign-in did not finish; the CLI and MCP entries remain installed; rerun this command to sign in"
-    say "restart your coding agent or reload its MCP servers, then ask it to set up Proofline"
+      refuse "CLI sign-in did not finish; the CLI and MCP entries remain installed; rerun this command to sign in, then run '$directory/proofline setup guide' to continue setup"
+    say "signed in; to continue setup in this session, run this and follow what it prints:"
+    say "  $directory/proofline setup guide"
+    say "a coding agent can follow it from its shell now; restart the agent or reload MCP only to use Proofline's MCP tools"
   else
-    say "run 'proofline login' to sign in"
+    say "run '$binary login' to sign in"
   fi
 }
 

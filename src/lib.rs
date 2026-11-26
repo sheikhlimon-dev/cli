@@ -22,6 +22,7 @@ pub mod render;
 mod result;
 mod sarif;
 mod scan;
+mod setup;
 mod severity;
 pub mod text;
 mod tls;
@@ -43,8 +44,8 @@ mod knowledge;
 mod tools;
 
 use crate::model::{
-    CodeAssessment, CommitReviewRequest, FileReviewRequest, OpenItems, PatchReviewRequest,
-    RepositoryNames, ReviewDetail, ReviewFilters, ReviewSummary,
+    CommitReviewRequest, FileReviewRequest, OpenItems, PatchReviewRequest, RepositoryNames,
+    ReviewDetail, ReviewFilters, ReviewPage, ReviewSummary,
 };
 use crate::origin::{DEFAULT_ORIGIN, Origin};
 use crate::outcome::Outcome;
@@ -111,13 +112,20 @@ enum Command {
     /// Read a plan or start and inspect its approved implementation.
     #[command(subcommand)]
     Plan(knowledge::PlanCommand),
-    /// Open browser onboarding; cloud trust requires browser sign-in.
+    /// Open browser onboarding, or read setup and its instructions from a shell.
+    ///
+    /// Without a subcommand, opens the GitHub App installation in a browser;
+    /// cloud trust requires browser sign-in.
+    #[command(args_conflicts_with_subcommands = true)]
     Setup {
+        /// Print the address instead of opening a browser.
         #[arg(long)]
         print: bool,
         /// GitHub organization slug; omit to open the authorized organization selector.
         #[arg(long)]
         organization: Option<String>,
+        #[command(subcommand)]
+        command: Option<setup::Command>,
     },
     /// Rerun the original immutable review subject.
     Rerun(tools::RerunArgs),
@@ -161,6 +169,8 @@ enum Command {
     Stop(StopArgs),
     /// Show the findings of the latest review of a commit or pull request.
     Findings(FindingsArgs),
+    /// Compare findings across review runs, identifying resolved, persistent, and new regressions.
+    Diff(DiffArgs),
     /// Forward a coding agent's stdio messages to this console's MCP server.
     Mcp,
     /// Commands for a CI job.
@@ -189,7 +199,7 @@ enum CiCommand {
     /// under test and exit by what the checks recorded.
     ///
     /// It reads the deploys of the commit in the repository, keeps those that
-    /// `--environment`, `--task`, `--run` and `--attempt` select, and waits
+    /// `--environment`, `--task`, `--deployment`, `--run` and `--attempt` select, and waits
     /// until each has recorded the `--until` check. It then prints one line for
     /// each deploy and check through `--until`: the checkpoint, its result, the
     /// checkpoint's gap codes and the deploy's page. Older servers supply
@@ -387,6 +397,43 @@ struct FindingsArgs {
     output: OutputArgs,
 }
 
+#[derive(Debug, Args)]
+struct DiffArgs {
+    /// Pull request number to compare recorded runs for.
+    #[arg(long, value_name = "NUMBER")]
+    pr: Option<u64>,
+    /// Specific review ID for the base (previous) run.
+    #[arg(
+        long,
+        value_name = "ID",
+        requires = "target_review",
+        conflicts_with = "pr"
+    )]
+    base_review: Option<Uuid>,
+    /// Specific review ID for the target (current) run.
+    #[arg(
+        long,
+        value_name = "ID",
+        requires = "base_review",
+        conflicts_with = "pr"
+    )]
+    target_review: Option<Uuid>,
+    /// Run number for the base review. Defaults to the run before target.
+    #[arg(long, requires = "pr")]
+    base_run: Option<u64>,
+    /// Run number for the target review. Defaults to the latest recorded run.
+    #[arg(long, requires = "pr")]
+    target_run: Option<u64>,
+    /// Exit with code 3 if any new or reintroduced regressions are detected.
+    #[arg(long)]
+    fail_on_regression: bool,
+    #[command(flatten)]
+    repository: RepositoryArgs,
+    /// Print machine-readable JSON diff instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum OutputFormat {
     Text,
@@ -454,8 +501,20 @@ pub async fn run(cli: Cli, token: Option<SecretString>) -> anyhow::Result<Verdic
             Ok(Verdict::Done)
         }
         Command::Setup {
+            command: Some(command),
+            ..
+        } => {
+            if let Some((name, arguments)) = command.request() {
+                config::call(origin, token, cli.org, name, arguments).await
+            } else {
+                write!(std::io::stdout().lock(), "{}", setup::GUIDE)?;
+                Ok(Verdict::Done)
+            }
+        }
+        Command::Setup {
             print,
             organization,
+            command: None,
         } => {
             let url = organization.as_deref().map_or_else(
                 || origin.join(["orgs"]),
@@ -582,6 +641,10 @@ pub async fn run(cli: Cli, token: Option<SecretString>) -> anyhow::Result<Verdic
             }
             let api = connect(Http::new(origin)?, token, cli.org).await?;
             findings(&api, &args).await
+        }
+        Command::Diff(args) => {
+            let api = connect(Http::new(origin)?, token, cli.org).await?;
+            diff(&api, &args).await
         }
         Command::Mcp => {
             let http = Http::new(origin)?;
@@ -944,7 +1007,7 @@ async fn pull_request_review(
     number: u64,
 ) -> anyhow::Result<Uuid> {
     let runs = pull_request_runs(api, args, number).await?;
-    let page = serde_json::from_value::<model::ReviewPage>(runs.raw)
+    let page = serde_json::from_value::<ReviewPage>(runs.raw)
         .with_context(|| format!("{} returned an unreadable review list", api.origin()))?;
     page.items
         .iter()
@@ -1025,7 +1088,7 @@ async fn review(api: &Api, args: &ReviewArgs) -> anyhow::Result<Verdict> {
         requested.run_number,
         number,
         if requested.automatic_reviews_paused {
-            "; automatic reviews are paused for this organization"
+            "; automatic reviews are stopped on this pull request"
         } else {
             ""
         }
@@ -1198,6 +1261,169 @@ async fn findings(api: &Api, args: &FindingsArgs) -> anyhow::Result<Verdict> {
     show(api, review_id, args.wait, &args.output, format, None).await
 }
 
+async fn diff(api: &Api, args: &DiffArgs) -> anyhow::Result<Verdict> {
+    let (base_detail, target_detail, base_label, target_label) = match (
+        args.base_review,
+        args.target_review,
+        args.pr,
+    ) {
+        (Some(base_id), Some(target_id), _) => {
+            let (_, base_detail) = api.review(base_id).await?;
+            let (_, target_detail) = api.review(target_id).await?;
+            let base_label = format!("review {}", base_detail.id);
+            let target_label = format!("review {}", target_detail.id);
+            (Some(base_detail), target_detail, base_label, target_label)
+        }
+        (None, None, pr_opt) => {
+            let (full_name, repository_id) = reviewed_repository(api, &args.repository).await?;
+            let pr = if let Some(pr) = pr_opt {
+                pr
+            } else {
+                let sha = git::head().await?;
+                let review_id = latest(api, repository_id, &sha, |item| {
+                    item.audit_mode.is_none()
+                        && item.pull_request_number.is_some()
+                        && item.head_commit_sha.as_deref() == Some(sha.as_str())
+                })
+                .await?
+                .with_context(|| {
+                    format!(
+                        "no pull request review of {full_name} has head commit {sha}; push it and open a pull request, or name one with --pr"
+                    )
+                })?;
+                let (_, detail) = api.review(review_id).await?;
+                let pr_num = detail.pull_request_number.with_context(|| {
+                    format!(
+                        "review {review_id} for {sha} is not associated with a pull request; pass --pr or --base-review and --target-review"
+                    )
+                })?;
+                u64::try_from(pr_num).context("invalid pull request number")?
+            };
+
+            let mut runs: Vec<(i64, Uuid)> = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut page_count = 0;
+            loop {
+                let history_raw = api
+                    .history_page(route_name(&full_name), pr, cursor.as_deref())
+                    .await?;
+                let history_page: ReviewPage = serde_json::from_value(history_raw)
+                    .context("could not parse pull request history")?;
+                for item in history_page.items {
+                    if item.kind == "PULL_REQUEST"
+                        && item.repository_id == Some(repository_id)
+                        && item.pull_request_number == i64::try_from(pr).ok()
+                        && let Some(num) = item.run_number
+                    {
+                        runs.push((num, item.id));
+                    }
+                }
+                page_count += 1;
+                let found_requested = match (args.base_run, args.target_run) {
+                    (Some(b), Some(t)) => {
+                        let (b_i, t_i) = (b as i64, t as i64);
+                        runs.iter().any(|&(n, _)| n == b_i) && runs.iter().any(|&(n, _)| n == t_i)
+                    }
+                    (Some(b), None) => runs.iter().any(|&(n, _)| n == b as i64),
+                    (None, Some(t)) => {
+                        let t_i = t as i64;
+                        runs.iter().any(|&(n, _)| n == t_i) && runs.iter().any(|&(n, _)| n < t_i)
+                    }
+                    (None, None) => page_count >= SEARCH_PAGES && runs.len() >= 2,
+                };
+                if found_requested {
+                    break;
+                }
+                match history_page.next_cursor {
+                    Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
+                    _ => break,
+                }
+            }
+            runs.sort_by_key(|&(num, _)| num);
+            runs.dedup_by_key(|&mut (num, _)| num);
+
+            if runs.is_empty() {
+                bail!("{full_name} #{pr} has no recorded runs");
+            }
+
+            let target_run = if let Some(r) = args.target_run {
+                r
+            } else {
+                let max_run = runs.last().unwrap().0;
+                u64::try_from(max_run).context("invalid target run number")?
+            };
+            let target_run_i64 = i64::try_from(target_run).context("target run out of range")?;
+            let target_item = runs
+                .iter()
+                .find(|&&(num, _)| num == target_run_i64)
+                .with_context(|| format!("{full_name} #{pr} has no run {target_run}"))?;
+            let (_, target_detail) = api.review(target_item.1).await?;
+
+            let base_run_opt: Option<u64> = args.base_run.or_else(|| {
+                runs.iter()
+                    .filter(|&&(num, _)| num < target_run_i64)
+                    .map(|&(num, _)| num)
+                    .next_back()
+                    .and_then(|num| u64::try_from(num).ok())
+            });
+
+            let base_detail = match base_run_opt {
+                Some(base_run) => {
+                    let base_run_i64 = i64::try_from(base_run).context("base run out of range")?;
+                    let base_item = runs
+                        .iter()
+                        .find(|&&(num, _)| num == base_run_i64)
+                        .with_context(|| format!("{full_name} #{pr} has no run {base_run}"))?;
+                    let (_, detail) = api.review(base_item.1).await?;
+                    Some(detail)
+                }
+                None => None,
+            };
+
+            let base_label = base_run_opt.map_or_else(
+                || format!("{full_name} #{pr} initial baseline"),
+                |r| format!("{full_name} #{pr} run {r}"),
+            );
+            let target_label = format!("{full_name} #{pr} run {target_run}");
+
+            (base_detail, target_detail, base_label, target_label)
+        }
+        _ => bail!("specify either --pr, or both --base-review and --target-review"),
+    };
+
+    let prev_findings = base_detail
+        .as_ref()
+        .map(outcome::all_findings)
+        .unwrap_or_default();
+    let curr_findings = outcome::all_findings(&target_detail);
+    let diff_result = outcome::diff_findings(&prev_findings, &curr_findings);
+
+    let mut stdout = std::io::stdout().lock();
+    if args.json {
+        writeln!(stdout, "{}", serde_json::to_string_pretty(&diff_result)?)?;
+    } else {
+        writeln!(
+            stdout,
+            "{}",
+            render::diff(&diff_result, &base_label, &target_label)
+        )?;
+    }
+
+    if args.fail_on_regression {
+        if target_detail.status != "COMPLETED"
+            || base_detail
+                .as_ref()
+                .is_some_and(|b| b.status != "COMPLETED")
+        {
+            return Ok(Verdict::NotComplete);
+        }
+        if !diff_result.regressions.is_empty() {
+            return Ok(Verdict::Regressed);
+        }
+    }
+    Ok(Verdict::Done)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("--timeout {minutes} minutes is too large to wait; choose a shorter timeout")]
 struct PollTimeoutTooLarge {
@@ -1338,11 +1564,7 @@ fn ci_ending(result: anyhow::Result<Verdict>) -> anyhow::Result<Verdict> {
 fn unavailable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ApiError>()
-        .is_some_and(|error| match error {
-            ApiError::Transport { .. } => true,
-            ApiError::Problem { status, .. } => *status >= 500,
-            ApiError::Protocol { .. } | ApiError::Renewal { .. } => false,
-        })
+        .is_some_and(ApiError::transient)
 }
 
 /// `ci review` once its inputs are read. In GitHub Actions without
@@ -1465,12 +1687,7 @@ async fn ci_review(
         state,
         OutputFormat::from_json(args.json),
     )?;
-    let verdict = ci_verdict(
-        state,
-        detail.open_items.as_ref(),
-        outcome::code_assessment(&detail),
-        args.fail_on,
-    );
+    let verdict = ci_verdict(state, detail.open_items.as_ref(), args.fail_on);
     say_ci_ending(api, review_id, &detail, state, verdict, args.timeout);
     Ok(verdict)
 }
@@ -1604,14 +1821,13 @@ fn say_ci_ending(
 /// How `ci review` ends for a review read as `state`. Completeness decides
 /// first: only a complete review is measured against `fail_on`, because the
 /// findings of a review that did not finish are not its whole result. The
-/// server counts open ENV findings and their current decisions. CODE findings
-/// have no projected decisions. Those of a complete CODE assessment are
-/// measured by their recorded severity and lifecycle. Without the ENV counts
-/// the threshold cannot be measured, which is never a pass.
+/// server's `open_items` counts alone measure it: they hold the open findings
+/// of both lanes under their current decisions, so a finding someone
+/// dismissed, accepted as a risk or marked fixed does not count. Without the
+/// counts the threshold cannot be measured, which is never a pass.
 fn ci_verdict(
     state: Option<Outcome>,
     open_items: Option<&OpenItems>,
-    code_assessment: Option<&CodeAssessment>,
     fail_on: Option<Severity>,
 ) -> Verdict {
     match state {
@@ -1625,9 +1841,7 @@ fn ci_verdict(
                     Severity::Warning => open.open_findings,
                     Severity::Serious => open.serious_findings,
                 };
-                let code_reaches =
-                    code_assessment.is_some_and(|code| outcome::code_reaches(code, threshold));
-                if count > 0 || code_reaches {
+                if count > 0 {
                     Verdict::ThresholdReached
                 } else {
                     Verdict::Done
@@ -1639,7 +1853,7 @@ fn ci_verdict(
 
 /// How `review --fail-on` ends for a complete review. A pull request counts
 /// its open items, as `ci review` does; other reviews have no finding
-/// decisions, so their findings count, as in a Git hook.
+/// decisions, so their unresolved findings count, as in a Git hook.
 fn review_verdict(detail: &ReviewDetail, fail_on: Option<Severity>) -> Verdict {
     let Some(threshold) = fail_on else {
         return Verdict::Done;
@@ -1648,7 +1862,6 @@ fn review_verdict(detail: &ReviewDetail, fail_on: Option<Severity>) -> Verdict {
         return ci_verdict(
             Some(Outcome::Completed),
             detail.open_items.as_ref(),
-            outcome::code_assessment(detail),
             fail_on,
         );
     }
@@ -2254,7 +2467,7 @@ mod tests {
             (None, Verdict::Unavailable),
         ] {
             assert_eq!(
-                ci_verdict(state, Some(&open(1, 1)), None, serious),
+                ci_verdict(state, Some(&open(1, 1)), serious),
                 verdict,
                 "{state:?}"
             );
@@ -2273,14 +2486,14 @@ mod tests {
             (None, serious, Verdict::Unavailable),
         ] {
             assert_eq!(
-                ci_verdict(complete, counts.as_ref(), None, fail_on),
+                ci_verdict(complete, counts.as_ref(), fail_on),
                 verdict,
                 "{counts:?} {fail_on:?}"
             );
         }
         // A gap decides before the missing counts do.
         assert_eq!(
-            ci_verdict(Some(Outcome::Incomplete), None, None, serious),
+            ci_verdict(Some(Outcome::Incomplete), None, serious),
             Verdict::NotComplete
         );
     }
